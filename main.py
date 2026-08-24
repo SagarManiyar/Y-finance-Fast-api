@@ -230,9 +230,9 @@ class TechnicalAnalysisEngine:
         freq_map = {
             '1d': 'D',
             '1w': 'W',
-            '1mo': 'M',
-            '3mo': 'Q',
-            '1y': 'Y'
+            '1mo': 'ME',
+            '3mo': 'QE',
+            '1y': 'YE'
         }
 
         if interval not in freq_map:

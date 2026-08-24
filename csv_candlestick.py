@@ -20,7 +20,13 @@ start_date = today - datetime.timedelta(days=180)  # last 6 months
 csv_file = "stocks_data.csv"
 
 # Fetch and store stock data if CSV not already created
-if not os.path.exists(csv_file):
+csv_is_stale = False
+if os.path.exists(csv_file):
+    import time
+    file_age_hours = (time.time() - os.path.getmtime(csv_file)) / 3600
+    csv_is_stale = file_age_hours > 24
+
+if not os.path.exists(csv_file) or csv_is_stale:
     all_data = []
     for ticker in companies:
         stock = yf.Ticker(ticker)

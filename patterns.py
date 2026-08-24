@@ -281,7 +281,7 @@ class CandlestickPatterns:
         self.df['avg_range'] = self.df['avg_range'].replace(0, self.df['range'].mean() or 0.01)
 
         # Handle any remaining NaN or infinite values
-        self.df = self.df.replace([np.inf, -np.inf], np.nan).fillna(method='bfill').fillna(0)
+        self.df = self.df.replace([np.inf, -np.inf], np.nan).bfill().fillna(0)
 
     def detect_hammer(self, threshold: float = 2.0) -> pd.Series:
         """
