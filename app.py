@@ -18,6 +18,23 @@
 #   - Response JSON shapes are identical.
 # ============================================================
 
+import io
+import threading
+
+# Patch pyarrow BEFORE pandas is imported.
+# pandas 3.0 + pyarrow 25 has a bug where Arrow extension types
+# (pandas.period, pandas.interval, etc.) get registered twice,
+# crashing with "A type extension with name ... already defined".
+# This patch makes duplicate registrations a silent no-op.
+import pyarrow as pa
+_original_register_ext = pa.register_extension_type
+def _safe_register_ext(ext_type):
+    try:
+        _original_register_ext(ext_type)
+    except (pa.ArrowKeyError, KeyError, Exception):
+        pass
+pa.register_extension_type = _safe_register_ext
+
 import uvicorn
 import yfinance as yf
 from fastapi import FastAPI, Request, HTTPException
@@ -27,21 +44,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-import io
 import boto3
 import json
 import base64
-import threading
-
-# Pre-register pandas Arrow extension types at module load.
-# Prevents "A type extension with name pandas.period already defined"
-# crash when concurrent requests call .to_parquet() simultaneously.
-try:
-    _buf = io.BytesIO()
-    pd.DataFrame({"_init": [1]}).to_parquet(_buf, engine="pyarrow")
-    del _buf
-except Exception:
-    pass
 
 _parquet_lock = threading.Lock()
 
