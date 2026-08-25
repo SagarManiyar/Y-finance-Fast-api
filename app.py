@@ -31,6 +31,29 @@ import io
 import boto3
 import json
 import base64
+import threading
+
+# Pre-register pandas Arrow extension types at module load.
+# Prevents "A type extension with name pandas.period already defined"
+# crash when concurrent requests call .to_parquet() simultaneously.
+try:
+    _buf = io.BytesIO()
+    pd.DataFrame({"_init": [1]}).to_parquet(_buf, engine="pyarrow")
+    del _buf
+except Exception:
+    pass
+
+_parquet_lock = threading.Lock()
+
+
+def safe_to_parquet(df):
+    """Thread-safe parquet conversion."""
+    buf = io.BytesIO()
+    with _parquet_lock:
+        df.to_parquet(buf, engine='pyarrow', index=False)
+    buf.seek(0)
+    return buf
+
 
 # ===========================
 # App Setup  (replaces Flask(__name__) + CORS(app))
@@ -492,10 +515,7 @@ async def yesterday_individual_overview(request: Request):
                     ]
                     df = df[[col for col in column_order if col in df.columns]]
 
-                    buffer = io.BytesIO()
-                    df.to_parquet(buffer, engine='pyarrow', index=False)
-                    buffer.seek(0)
-
+                    buffer = safe_to_parquet(df)
                     file_content   = buffer.read()
                     base64_content = base64.b64encode(file_content).decode('utf-8')
 
@@ -555,9 +575,7 @@ async def yesterday(request: Request):
             raise HTTPException(status_code=404, detail="No valid data found to create file")
 
         df     = pd.DataFrame(results_list)
-        buffer = io.BytesIO()
-        df.to_parquet(buffer, engine='pyarrow', index=False)
-        buffer.seek(0)
+        buffer = safe_to_parquet(df)
 
         filename = f"yesterday_stocks_{datetime.now().strftime('%Y%m%d')}.parquet"
 
@@ -599,10 +617,7 @@ async def yesterday_individual(request: Request):
                     res["Ticker"] = ticker
                     df = pd.DataFrame([res])
 
-                    buffer = io.BytesIO()
-                    df.to_parquet(buffer, engine='pyarrow', index=False)
-                    buffer.seek(0)
-
+                    buffer = safe_to_parquet(df)
                     file_content   = buffer.read()
                     base64_content = base64.b64encode(file_content).decode('utf-8')
 
@@ -792,10 +807,7 @@ async def last_10_days_overview(request: Request):
                     errors.append({"ticker": ticker, "error": "No rows returned"})
                     continue
 
-                buf = io.BytesIO()
-                res.to_parquet(buf, engine="pyarrow", index=False)
-                buf.seek(0)
-
+                buf = safe_to_parquet(res)
                 file_content   = buf.read()
                 base64_content = base64.b64encode(file_content).decode("utf-8")
 
@@ -868,10 +880,7 @@ async def history_5y(request: Request):
                 res    = future.result()
 
                 if isinstance(res, pd.DataFrame):
-                    buffer = io.BytesIO()
-                    res.to_parquet(buffer, engine='pyarrow', index=False)
-                    buffer.seek(0)
-
+                    buffer = safe_to_parquet(res)
                     file_content   = buffer.read()
                     base64_content = base64.b64encode(file_content).decode('utf-8')
 
