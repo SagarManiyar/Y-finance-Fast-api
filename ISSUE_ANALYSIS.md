@@ -216,3 +216,58 @@ After applying all fixes, verify:
 | `patterns.py` | 284 | `.fillna(method='bfill')` -> `.bfill()` | pandas 3.0 removed `method` param |
 | `main.py` | 233-235 | `'M'`->`'ME'`, `'Q'`->`'QE'`, `'Y'`->`'YE'` | pandas 3.0 removed old aliases |
 | `csv_candlestick.py` | 23 | Remove/update `if not os.path.exists` check | Stale CSV never refreshes |
+
+---
+
+## Issue 3: Server Error "A type extension with name pandas.period already defined" (2026-08-25/26)
+
+### Symptom
+
+Hitting the deployed `/history-5y` endpoint on `https://y-finance.smart-copilots.ai/` (e.g. via Postman) returned:
+
+```json
+{"detail":"Server error: A type extension with name pandas.period already defined"}
+```
+
+### Root Cause: Two supervisor programs running the same app on different ports, ALB pointed at the stale one
+
+The server (`i-07dfd7d8914b4d74f`) runs **two separate supervisor-managed processes** for the same `app.py`:
+
+| Supervisor program   | Launch command                                              | Port | Notes |
+|-----------------------|--------------------------------------------------------------|------|-------|
+| `fastapi`             | `python /var/www/y-finance-fast-api/app.py`                  | 5000 | Hardcoded port in `app.py`'s `__main__` block. **This is what the ALB target group actually forwards to.** |
+| `y-finance-fast-api`   | `uvicorn app:app --host 0.0.0.0 --port 8000`                  | 8000 | Not reachable from the public internet at all. |
+
+The ALB (`y-finance-smart-copilots-ai-alb`) → target group `Y-Finance-Fast-Api-tg` → forwards `HTTP:80`/`HTTPS:443` traffic to **port 5000** on this instance.
+
+During earlier debugging, code changes (pyarrow monkey-patch, `safe_to_parquet` helper, etc.) were deployed to `app.py` on disk, and the `y-finance-fast-api` (port 8000) supervisor program was restarted to pick them up. However, the `fastapi` program (port 5000) — the one actually receiving public traffic — was **never restarted**, so it kept running the old, unpatched code in memory indefinitely. This is why:
+- Direct testing against `http://127.0.0.1:8000/...` always succeeded (correct process).
+- Every request through the public URL / Postman always failed (stale process on port 5000).
+- The target group showed `Unhealthy` with `404` health-check failures, since the stale process was in a broken state.
+
+### Fix
+
+Restart the correct supervisor program — **`fastapi`**, not `y-finance-fast-api`:
+
+```bash
+sudo /opt/supervisor-venv/bin/supervisorctl -c /etc/supervisor/supervisord.conf restart fastapi
+```
+
+(`supervisorctl` is not on PATH by default on this box; supervisord runs from `/opt/supervisor-venv/`.)
+
+Verify:
+
+```bash
+curl -s -X POST https://y-finance.smart-copilots.ai/history-5y -H "Content-Type: application/json" -d '{"tickers": "AAPL"}'
+```
+
+Should return `"status":"success"` with parquet data.
+
+### Important operational note for future deploys
+
+**Any code change to `app.py` must be picked up by restarting the `fastapi` program (port 5000)** — that is the process actually serving `y-finance.smart-copilots.ai`. Restarting `y-finance-fast-api` (port 8000) alone has no effect on production traffic and will cause the exact same "works locally, fails via public URL" confusion again.
+
+Longer-term cleanup to consider (not yet done — requires deliberate decision, since it touches production routing):
+- Confirm whether the `y-finance-fast-api` (port 8000, uvicorn) supervisor program is still needed at all, or if it's a leftover from an earlier deployment attempt.
+- If not needed, remove it to avoid two processes running the same app in different states.
+- Alternatively, standardize on one launch method (uvicorn) and point the ALB target group at that single port.

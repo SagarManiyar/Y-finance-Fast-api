@@ -846,6 +846,28 @@ async def last_10_days_overview(request: Request):
 # ===========================
 # /history-5y endpoint
 # ===========================
+# def fetch_5y_data(ticker):
+#     try:
+#         stock = yf.Ticker(ticker)
+#         df    = stock.history(period="5y", interval="1d")
+
+#         if df.empty:
+#             return None
+
+#         df = df.reset_index()
+#         df['Date']          = df['Date'].dt.strftime('%Y-%m-%d')
+#         df["PreviousClose"] = df["Close"].shift(1)
+
+#         return df
+
+#     except Exception as e:
+#         print(f"Error fetching {ticker}: {e}")
+#         return None
+def _exclude_today(df, date_col='Date'):
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    return df[df[date_col].astype(str).str[:10] < today_str].reset_index(drop=True)
+
+
 def fetch_5y_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -855,7 +877,14 @@ def fetch_5y_data(ticker):
             return None
 
         df = df.reset_index()
-        df['Date']          = df['Date'].dt.strftime('%Y-%m-%d')
+        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
+
+        # FIX: drop today's row — market may still be open / data incomplete
+        df = _exclude_today(df, 'Date')
+
+        if df.empty:
+            return None
+
         df["PreviousClose"] = df["Close"].shift(1)
 
         return df
@@ -863,7 +892,6 @@ def fetch_5y_data(ticker):
     except Exception as e:
         print(f"Error fetching {ticker}: {e}")
         return None
-
 
 @app.post("/history-5y")
 async def history_5y(request: Request):
