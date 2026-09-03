@@ -943,6 +943,316 @@ async def history_5y(request: Request):
 
 
 # ===========================
+# Fundamental Data Helpers
+# ===========================
+
+def get_error_suggestion(ticker, error_msg):
+    """Generate error suggestions based on error message."""
+    error_lower = str(error_msg).lower()
+
+    if "invalid" in error_lower or "not found" in error_lower:
+        return f"Invalid ticker symbol '{ticker}'. Check if the symbol is correct. Use official stock exchange symbols (e.g., AAPL for Apple)."
+    elif "delisted" in error_lower or "no data" in error_lower:
+        return f"No data available for '{ticker}'. The company may be delisted, or the ticker symbol may have changed."
+    elif "network" in error_lower or "connection" in error_lower:
+        return "Network error connecting to YFinance. Please try again later."
+    else:
+        return f"Unable to fetch fundamental data for '{ticker}'. Verify ticker symbol and try again."
+
+
+def fetch_fundamental_data(ticker):
+    """
+    Fetch all fundamental data for a ticker.
+    Returns tuple: (data_df, error_msg)
+    """
+    try:
+        stock = yf.Ticker(ticker)
+
+        # Fetch all available data
+        fundamental_data = {}
+
+        # 1. Stock Info
+        try:
+            info = stock.info
+            if info:
+                fundamental_data.update({"info_" + k: [v] for k, v in info.items()})
+        except Exception as e:
+            print(f"Warning: Could not fetch info for {ticker}: {e}")
+
+        # 2. Income Statement (annual)
+        try:
+            income_stmt = stock.income_stmt
+            if income_stmt is not None and not income_stmt.empty:
+                income_stmt_T = income_stmt.T
+                income_stmt_T.columns = ["income_" + str(col) for col in income_stmt_T.columns]
+                for col in income_stmt_T.columns:
+                    fundamental_data[col] = income_stmt_T[col].values
+        except Exception as e:
+            print(f"Warning: Could not fetch income statement for {ticker}: {e}")
+
+        # 3. Income Statement (quarterly)
+        try:
+            quarterly_income = stock.quarterly_income_stmt
+            if quarterly_income is not None and not quarterly_income.empty:
+                quarterly_income_T = quarterly_income.T
+                quarterly_income_T.columns = ["quarterly_income_" + str(col) for col in quarterly_income_T.columns]
+                for col in quarterly_income_T.columns:
+                    fundamental_data[col] = quarterly_income_T[col].values
+        except Exception as e:
+            print(f"Warning: Could not fetch quarterly income statement for {ticker}: {e}")
+
+        # 4. Balance Sheet (annual)
+        try:
+            balance_sheet = stock.balance_sheet
+            if balance_sheet is not None and not balance_sheet.empty:
+                balance_sheet_T = balance_sheet.T
+                balance_sheet_T.columns = ["balance_" + str(col) for col in balance_sheet_T.columns]
+                for col in balance_sheet_T.columns:
+                    fundamental_data[col] = balance_sheet_T[col].values
+        except Exception as e:
+            print(f"Warning: Could not fetch balance sheet for {ticker}: {e}")
+
+        # 5. Balance Sheet (quarterly)
+        try:
+            quarterly_balance = stock.quarterly_balance_sheet
+            if quarterly_balance is not None and not quarterly_balance.empty:
+                quarterly_balance_T = quarterly_balance.T
+                quarterly_balance_T.columns = ["quarterly_balance_" + str(col) for col in quarterly_balance_T.columns]
+                for col in quarterly_balance_T.columns:
+                    fundamental_data[col] = quarterly_balance_T[col].values
+        except Exception as e:
+            print(f"Warning: Could not fetch quarterly balance sheet for {ticker}: {e}")
+
+        # 6. Cash Flow (annual)
+        try:
+            cash_flow = stock.cashflow
+            if cash_flow is not None and not cash_flow.empty:
+                cash_flow_T = cash_flow.T
+                cash_flow_T.columns = ["cashflow_" + str(col) for col in cash_flow_T.columns]
+                for col in cash_flow_T.columns:
+                    fundamental_data[col] = cash_flow_T[col].values
+        except Exception as e:
+            print(f"Warning: Could not fetch cash flow for {ticker}: {e}")
+
+        # 7. Cash Flow (quarterly)
+        try:
+            quarterly_cashflow = stock.quarterly_cashflow
+            if quarterly_cashflow is not None and not quarterly_cashflow.empty:
+                quarterly_cashflow_T = quarterly_cashflow.T
+                quarterly_cashflow_T.columns = ["quarterly_cashflow_" + str(col) for col in quarterly_cashflow_T.columns]
+                for col in quarterly_cashflow_T.columns:
+                    fundamental_data[col] = quarterly_cashflow_T[col].values
+        except Exception as e:
+            print(f"Warning: Could not fetch quarterly cash flow for {ticker}: {e}")
+
+        # Check if we got any data
+        if not fundamental_data:
+            return None, get_error_suggestion(ticker, "No fundamental data found")
+
+        # Create DataFrame - handle varying lengths by padding
+        max_len = max(len(v) if isinstance(v, (list, np.ndarray)) else 1 for v in fundamental_data.values())
+
+        for key in fundamental_data:
+            if isinstance(fundamental_data[key], (list, np.ndarray)):
+                data = fundamental_data[key]
+            else:
+                data = [fundamental_data[key]]
+
+            # Pad shorter arrays to match max length
+            if len(data) < max_len:
+                data = list(data) + [None] * (max_len - len(data))
+            fundamental_data[key] = data[:max_len]
+
+        df = pd.DataFrame(fundamental_data)
+
+        if df.empty:
+            return None, get_error_suggestion(ticker, "Empty fundamental data")
+
+        return df, None
+
+    except Exception as e:
+        error_msg = str(e)
+        suggestion = get_error_suggestion(ticker, error_msg)
+        return None, suggestion
+
+
+@app.post("/fundamentals/{ticker}")
+async def get_fundamentals_single(ticker: str):
+    """
+    Fetch fundamental data for a single ticker.
+    Returns: JSON with parquet content (base64 encoded)
+    """
+    try:
+        ticker = ticker.upper().strip()
+
+        if not ticker:
+            raise HTTPException(status_code=400, detail="Ticker is required")
+
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        current_timestamp = datetime.now().isoformat() + "Z"
+
+        # Fetch fundamental data
+        df, error = fetch_fundamental_data(ticker)
+
+        if df is None or df.empty:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "failed",
+                    "count": 1,
+                    "data_type": "fundamental",
+                    "files": [
+                        {
+                            "ticker": ticker,
+                            "status": "failed",
+                            "error": error or "No fundamental data available",
+                            "suggestion": get_error_suggestion(ticker, error or "No data"),
+                            "date": current_date_str
+                        }
+                    ]
+                }
+            )
+
+        # Convert to parquet
+        buffer = safe_to_parquet(df)
+        file_content = buffer.read()
+        base64_content = base64.b64encode(file_content).decode('utf-8')
+
+        return {
+            "status": "success",
+            "count": 1,
+            "data_type": "fundamental",
+            "files": [
+                {
+                    "ticker": ticker,
+                    "date": current_date_str,
+                    "fetch_date": current_timestamp,
+                    "data_type": "fundamental",
+                    "status": "success",
+                    "content": base64_content,
+                    "size_bytes": len(file_content),
+                    "metadata": {
+                        "rows": len(df),
+                        "columns": len(df.columns),
+                        "fields": df.columns.tolist(),
+                        "data_sources": ["stock_info", "income_statement", "balance_sheet", "cash_flow", "quarterly_statements"]
+                    }
+                }
+            ]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+
+@app.post("/fundamentals")
+async def get_fundamentals_batch(request: Request):
+    """
+    Fetch fundamental data for multiple tickers (batch).
+    Body: {"tickers": ["AAPL", "TSLA", ...]}
+    Max 100 tickers per request.
+    Returns: JSON with status for each ticker
+    """
+    try:
+        data = await request.json()
+        tickers_input = data.get("tickers", [])
+
+        if not tickers_input:
+            raise HTTPException(status_code=400, detail="Tickers array is required")
+
+        # Normalize tickers
+        if isinstance(tickers_input, str):
+            tickers = [t.strip().upper() for t in tickers_input.split(",")]
+        elif isinstance(tickers_input, list):
+            tickers = [str(t).strip().upper() for t in tickers_input]
+        else:
+            raise HTTPException(status_code=400, detail="Tickers must be string or array")
+
+        # Max 100 tickers
+        if len(tickers) > 100:
+            raise HTTPException(status_code=400, detail="Maximum 100 tickers per request")
+
+        tickers = list(set(tickers))  # Remove duplicates
+        ticker_files = []
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        current_timestamp = datetime.now().isoformat() + "Z"
+
+        max_workers = min(10, len(tickers))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {executor.submit(fetch_fundamental_data, t): t for t in tickers}
+
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+
+                try:
+                    df, error = future.result()
+
+                    if df is not None and not df.empty:
+                        # Success
+                        buffer = safe_to_parquet(df)
+                        file_content = buffer.read()
+                        base64_content = base64.b64encode(file_content).decode('utf-8')
+
+                        ticker_files.append({
+                            "ticker": ticker,
+                            "date": current_date_str,
+                            "fetch_date": current_timestamp,
+                            "data_type": "fundamental",
+                            "status": "success",
+                            "content": base64_content,
+                            "size_bytes": len(file_content),
+                            "metadata": {
+                                "rows": len(df),
+                                "columns": len(df.columns),
+                                "fields": df.columns.tolist(),
+                                "data_sources": ["stock_info", "income_statement", "balance_sheet", "cash_flow"]
+                            }
+                        })
+                    else:
+                        # Failed
+                        ticker_files.append({
+                            "ticker": ticker,
+                            "date": current_date_str,
+                            "status": "failed",
+                            "error": error or "No fundamental data available",
+                            "suggestion": get_error_suggestion(ticker, error or "No data")
+                        })
+
+                except Exception as e:
+                    ticker_files.append({
+                        "ticker": ticker,
+                        "date": current_date_str,
+                        "status": "failed",
+                        "error": str(e),
+                        "suggestion": get_error_suggestion(ticker, str(e))
+                    })
+
+        # Count successes and failures
+        success_count = sum(1 for f in ticker_files if f.get("status") == "success")
+        failed_count = len(ticker_files) - success_count
+
+        return {
+            "status": "completed",
+            "count": len(ticker_files),
+            "data_type": "fundamental",
+            "summary": {
+                "total": len(ticker_files),
+                "success": success_count,
+                "failed": failed_count
+            },
+            "files": ticker_files
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+
+# ===========================
 # App Entry Point
 # CHANGED: app.run(debug=True) → uvicorn.run(...)
 # port kept at 5000 to match existing Flask setup
