@@ -946,6 +946,131 @@ async def history_5y(request: Request):
 # Fundamental Data Helpers
 # ===========================
 
+# Quant Screener v1 — the 167 fields the extract is restricted to.
+# Order below IS the parquet column order. Grouped by screener section.
+# Verified present on AAPL (167/167) against yfinance 1.6.0 on 2026-09-03.
+QUANT_FIELDS = [
+    # --- SECTION 1: identity, currency & universe control (19) ---
+    "info_symbol", "info_shortName", "info_longName", "info_exchange",
+    "info_fullExchangeName", "info_quoteType", "info_currency",
+    "info_financialCurrency", "info_sector", "info_sectorKey", "info_industry",
+    "info_industryKey", "info_country", "info_region", "info_marketCap",
+    "info_lastFiscalYearEnd", "info_mostRecentQuarter",
+    "info_exchangeDataDelayedBy", "info_maxAge",
+
+    # --- SECTION 2: value factor (13) ---
+    "info_trailingPE", "info_forwardPE", "info_priceToBook",
+    "info_priceToSalesTrailing12Months", "info_enterpriseToEbitda",
+    "info_enterpriseToRevenue", "info_pegRatio", "info_trailingPegRatio",
+    "info_dividendYield", "info_enterpriseValue", "info_bookValue",
+    "info_payoutRatio", "info_trailingAnnualDividendYield",
+
+    # --- SECTION 3: growth factor (19) ---
+    "info_revenueGrowth", "info_earningsGrowth", "info_earningsQuarterlyGrowth",
+    "info_returnOnEquity", "info_returnOnAssets", "info_grossMargins",
+    "info_operatingMargins", "info_ebitdaMargins", "info_profitMargins",
+    "info_trailingEps", "info_forwardEps", "info_epsTrailingTwelveMonths",
+    "info_epsForward", "info_epsCurrentYear", "info_revenuePerShare",
+    "info_totalRevenue", "info_netIncomeToCommon", "info_freeCashflow",
+    "info_operatingCashflow",
+
+    # --- SECTION 3b: growth series inputs (25) ---
+    "income_Total Revenue", "income_Net Income", "income_Gross Profit",
+    "income_Diluted EPS", "income_Basic EPS", "income_Diluted Average Shares",
+    "income_Operating Income", "income_EBIT", "income_EBITDA",
+    "income_Normalized EBITDA", "income_Research And Development",
+    "income_Tax Rate For Calcs", "income_Tax Provision", "income_Pretax Income",
+    "quarterly_income_Total Revenue", "quarterly_income_Net Income",
+    "quarterly_income_Gross Profit", "quarterly_income_Diluted EPS",
+    "quarterly_income_EBIT", "quarterly_income_EBITDA",
+    "quarterly_income_Operating Income", "cashflow_Free Cash Flow",
+    "quarterly_cashflow_Free Cash Flow", "balance_Stockholders Equity",
+    "quarterly_balance_Stockholders Equity",
+
+    # --- SECTION 4: momentum factor, info_* portion only (22) ---
+    # The rest of Momentum needs .history() OHLCV and is NOT in this extract.
+    "info_currentPrice", "info_regularMarketPrice", "info_fiftyDayAverage",
+    "info_twoHundredDayAverage", "info_fiftyDayAverageChangePercent",
+    "info_twoHundredDayAverageChangePercent", "info_fiftyTwoWeekHigh",
+    "info_fiftyTwoWeekLow", "info_fiftyTwoWeekHighChangePercent",
+    "info_fiftyTwoWeekLowChangePercent", "info_fiftyTwoWeekChangePercent",
+    "info_52WeekChange", "info_SandP52WeekChange", "info_volume",
+    "info_regularMarketVolume", "info_averageVolume", "info_averageVolume10days",
+    "info_averageDailyVolume10Day", "info_averageDailyVolume3Month",
+    "info_beta", "info_allTimeHigh", "info_allTimeLow",
+
+    # --- SECTION 5: quality factor component inputs (24) ---
+    "balance_Total Assets", "balance_Total Liabilities Net Minority Interest",
+    "balance_Working Capital", "balance_Retained Earnings", "balance_Total Debt",
+    "balance_Net Debt", "balance_Invested Capital",
+    "balance_Cash And Cash Equivalents",
+    "balance_Cash Cash Equivalents And Short Term Investments",
+    "balance_Current Assets", "balance_Current Liabilities",
+    "balance_Long Term Debt", "balance_Inventory",
+    "balance_Ordinary Shares Number", "balance_Share Issued",
+    "balance_Common Stock Equity", "cashflow_Operating Cash Flow",
+    "cashflow_Capital Expenditure", "cashflow_Stock Based Compensation",
+    "quarterly_balance_Total Assets", "quarterly_balance_Current Assets",
+    "quarterly_balance_Current Liabilities",
+    "quarterly_balance_Ordinary Shares Number",
+    "quarterly_cashflow_Operating Cash Flow",
+
+    # --- SECTION 6: pre-screen removal criteria (37) ---
+    "info_debtToEquity", "info_ebitda", "info_totalDebt", "info_currentRatio",
+    "info_quickRatio", "info_totalCash", "info_totalCashPerShare",
+    "income_Interest Expense", "income_Interest Expense Non Operating",
+    "income_Net Interest Income", "cashflow_Interest Paid Supplemental Data",
+    "cashflow_Issuance Of Capital Stock", "cashflow_Common Stock Issuance",
+    "cashflow_Repurchase Of Capital Stock", "cashflow_Net Common Stock Issuance",
+    "quarterly_cashflow_Net Common Stock Issuance", "info_sharesOutstanding",
+    "info_impliedSharesOutstanding", "info_floatShares",
+    "info_recommendationMean", "info_recommendationKey",
+    "info_numberOfAnalystOpinions", "info_averageAnalystRating",
+    "info_targetMeanPrice", "info_targetMedianPrice", "info_targetHighPrice",
+    "info_targetLowPrice", "info_auditRisk", "info_overallRisk",
+    "info_sharesShort", "info_sharesShortPriorMonth", "info_shortRatio",
+    "info_shortPercentOfFloat", "info_sharesPercentSharesOut",
+    "info_dateShortInterest", "info_heldPercentInstitutions",
+    "info_heldPercentInsiders",
+
+    # --- SECTION 7: earnings timing (8) ---
+    "info_earningsTimestamp", "info_earningsTimestampStart",
+    "info_earningsTimestampEnd", "info_isEarningsDateEstimate",
+    "info_exDividendDate", "info_dividendDate", "info_lastSplitDate",
+    "info_lastSplitFactor",
+]
+
+# Fields that gate the pre-screen removal criteria. A ticker whose extract has
+# NO usable value for any of these is returned as status "failed", because a
+# null here would silently pass a stock that the removal criteria should reject.
+#
+# Deliberately NOT the full 37-field Section 6 list: the 6 short-interest fields
+# and cashflow_Interest Paid Supplemental Data were absent on every non-US
+# listing tested (SHEL.L / 005930.KS / NPN.JO), so gating on those would fail
+# 100% of non-US tickers. Every field below was present on all 4 tickers tested.
+PRESCREEN_CRITICAL_FIELDS = [
+    "info_debtToEquity",        # Heavy Debt — D/E
+    "info_ebitda",              # Net Debt/EBITDA denominator
+    "info_totalDebt",           # leverage
+    "info_currentRatio",        # solvency stress: current ratio < 1
+    "info_sharesOutstanding",   # dilution screen
+    "income_Interest Expense",  # interest coverage
+]
+
+# Prefix -> yfinance accessor. LONGEST PREFIX FIRST so that, for example,
+# "quarterly_income_*" is never mis-bucketed into the annual "income_*" source.
+_FUNDAMENTAL_SOURCES = [
+    ("quarterly_income_", "quarterly_income_stmt"),
+    ("quarterly_balance_", "quarterly_balance_sheet"),
+    ("quarterly_cashflow_", "quarterly_cashflow"),
+    ("income_", "income_stmt"),
+    ("balance_", "balance_sheet"),
+    ("cashflow_", "cashflow"),
+]
+
+_QUANT_FIELDS_SET = set(QUANT_FIELDS)
+
+
 def get_error_suggestion(ticker, error_msg):
     """Generate error suggestions based on error message."""
     error_lower = str(error_msg).lower()
@@ -962,125 +1087,180 @@ def get_error_suggestion(ticker, error_msg):
 
 def fetch_fundamental_data(ticker):
     """
-    Fetch all fundamental data for a ticker.
-    Returns tuple: (data_df, error_msg)
+    Fetch the 167 Quant Screener fundamental fields for a ticker.
+
+    Returns tuple: (data_df, error_msg, missing_fields)
+
+    Output shape — identical to the earlier full-field extract, just narrowed:
+      - Exactly 167 columns, in QUANT_FIELDS order. Fields Yahoo does not
+        return are still present, filled with null, so every ticker's parquet
+        has the same schema and 100 files concatenate without reconciliation.
+      - One row per fiscal period, ordinally aligned: row 0 = most recent
+        period, row 1 = next most recent, etc. Row count = the longest
+        statement returned for that ticker (4-7 in testing).
+      - info_* are point-in-time snapshots, so they carry a value on row 0
+        and null on rows 1+.
+
+    NOTE on ordinal alignment: annual and quarterly statements have different
+    period-end dates and different lengths, so row 1 of an "income_*" column
+    and row 1 of a "quarterly_income_*" column are DIFFERENT dates. This
+    extract carries no period-end date columns, so the dates are not
+    recoverable from the parquet alone.
     """
     try:
         stock = yf.Ticker(ticker)
 
-        # Fetch all available data
-        fundamental_data = {}
+        snapshot = {}   # info_* -> single scalar value
+        series = {}     # statement fields -> array, one value per fiscal period
 
-        # 1. Stock Info
+        # --- 1. Stock info (snapshot) ---
         try:
-            info = stock.info
-            if info:
-                fundamental_data.update({"info_" + k: [v] for k, v in info.items()})
+            info = stock.info or {}
+            for key, value in info.items():
+                field = "info_" + key
+                if field in _QUANT_FIELDS_SET:
+                    snapshot[field] = value
         except Exception as e:
-            print(f"Warning: Could not fetch info for {ticker}: {e}")
+            print(f"Warning: could not fetch info for {ticker}: {e}")
 
-        # 2. Income Statement (annual)
-        try:
-            income_stmt = stock.income_stmt
-            if income_stmt is not None and not income_stmt.empty:
-                income_stmt_T = income_stmt.T
-                income_stmt_T.columns = ["income_" + str(col) for col in income_stmt_T.columns]
-                for col in income_stmt_T.columns:
-                    fundamental_data[col] = income_stmt_T[col].values
-        except Exception as e:
-            print(f"Warning: Could not fetch income statement for {ticker}: {e}")
+        # --- 2-7. Annual + quarterly income / balance / cashflow (series) ---
+        for prefix, accessor in _FUNDAMENTAL_SOURCES:
+            try:
+                stmt = getattr(stock, accessor)
+            except Exception as e:
+                print(f"Warning: could not fetch {accessor} for {ticker}: {e}")
+                continue
 
-        # 3. Income Statement (quarterly)
-        try:
-            quarterly_income = stock.quarterly_income_stmt
-            if quarterly_income is not None and not quarterly_income.empty:
-                quarterly_income_T = quarterly_income.T
-                quarterly_income_T.columns = ["quarterly_income_" + str(col) for col in quarterly_income_T.columns]
-                for col in quarterly_income_T.columns:
-                    fundamental_data[col] = quarterly_income_T[col].values
-        except Exception as e:
-            print(f"Warning: Could not fetch quarterly income statement for {ticker}: {e}")
+            if not isinstance(stmt, pd.DataFrame) or stmt.empty:
+                continue
 
-        # 4. Balance Sheet (annual)
-        try:
-            balance_sheet = stock.balance_sheet
-            if balance_sheet is not None and not balance_sheet.empty:
-                balance_sheet_T = balance_sheet.T
-                balance_sheet_T.columns = ["balance_" + str(col) for col in balance_sheet_T.columns]
-                for col in balance_sheet_T.columns:
-                    fundamental_data[col] = balance_sheet_T[col].values
-        except Exception as e:
-            print(f"Warning: Could not fetch balance sheet for {ticker}: {e}")
+            # Yahoo returns period columns most-recent-first today, but nothing
+            # in the API guarantees that. Sort explicitly descending: row 0 MUST
+            # be the most recent period, or every CAGR / YoY delta computed
+            # downstream silently inverts sign with no visible error.
+            try:
+                stmt = stmt.reindex(columns=sorted(stmt.columns, reverse=True))
+            except TypeError:
+                pass  # unorderable column labels — keep Yahoo's own order
 
-        # 5. Balance Sheet (quarterly)
-        try:
-            quarterly_balance = stock.quarterly_balance_sheet
-            if quarterly_balance is not None and not quarterly_balance.empty:
-                quarterly_balance_T = quarterly_balance.T
-                quarterly_balance_T.columns = ["quarterly_balance_" + str(col) for col in quarterly_balance_T.columns]
-                for col in quarterly_balance_T.columns:
-                    fundamental_data[col] = quarterly_balance_T[col].values
-        except Exception as e:
-            print(f"Warning: Could not fetch quarterly balance sheet for {ticker}: {e}")
+            # Index positionally rather than by label: Yahoo occasionally
+            # repeats a line-item label, and .loc on a duplicate label returns
+            # a DataFrame instead of a Series. First occurrence wins.
+            for pos, label in enumerate(stmt.index):
+                field = prefix + str(label)
+                if field in _QUANT_FIELDS_SET and field not in series:
+                    series[field] = stmt.iloc[pos].to_numpy()
 
-        # 6. Cash Flow (annual)
-        try:
-            cash_flow = stock.cashflow
-            if cash_flow is not None and not cash_flow.empty:
-                cash_flow_T = cash_flow.T
-                cash_flow_T.columns = ["cashflow_" + str(col) for col in cash_flow_T.columns]
-                for col in cash_flow_T.columns:
-                    fundamental_data[col] = cash_flow_T[col].values
-        except Exception as e:
-            print(f"Warning: Could not fetch cash flow for {ticker}: {e}")
+        if not snapshot and not series:
+            return None, get_error_suggestion(ticker, "No fundamental data found"), list(QUANT_FIELDS)
 
-        # 7. Cash Flow (quarterly)
-        try:
-            quarterly_cashflow = stock.quarterly_cashflow
-            if quarterly_cashflow is not None and not quarterly_cashflow.empty:
-                quarterly_cashflow_T = quarterly_cashflow.T
-                quarterly_cashflow_T.columns = ["quarterly_cashflow_" + str(col) for col in quarterly_cashflow_T.columns]
-                for col in quarterly_cashflow_T.columns:
-                    fundamental_data[col] = quarterly_cashflow_T[col].values
-        except Exception as e:
-            print(f"Warning: Could not fetch quarterly cash flow for {ticker}: {e}")
+        # Row count = longest statement actually returned for this ticker.
+        max_len = max((len(arr) for arr in series.values()), default=1) or 1
 
-        # Check if we got any data
-        if not fundamental_data:
-            return None, get_error_suggestion(ticker, "No fundamental data found")
-
-        # Create DataFrame - handle varying lengths by padding
-        max_len = max(len(v) if isinstance(v, (list, np.ndarray)) else 1 for v in fundamental_data.values())
-
-        for key in fundamental_data:
-            if isinstance(fundamental_data[key], (list, np.ndarray)):
-                data = fundamental_data[key]
+        # Build every one of the 167 columns, in spec order, padding to max_len.
+        columns = {}
+        for field in QUANT_FIELDS:
+            if field in series:
+                values = list(series[field])[:max_len]
+                values += [None] * (max_len - len(values))
+            elif field in snapshot:
+                values = [snapshot[field]] + [None] * (max_len - 1)
             else:
-                data = [fundamental_data[key]]
+                values = [None] * max_len
+            columns[field] = values
 
-            # Pad shorter arrays to match max length
-            if len(data) < max_len:
-                data = list(data) + [None] * (max_len - len(data))
-            fundamental_data[key] = data[:max_len]
-
-        df = pd.DataFrame(fundamental_data)
+        df = pd.DataFrame(columns, columns=QUANT_FIELDS)
 
         if df.empty:
-            return None, get_error_suggestion(ticker, "Empty fundamental data")
+            return None, get_error_suggestion(ticker, "Empty fundamental data"), list(QUANT_FIELDS)
 
-        return df, None
+        # A field counts as missing when it has no usable value at all — either
+        # Yahoo never returned it, or returned it as null. Both are unusable
+        # downstream, and the pre-screen gate needs to treat them the same.
+        missing_fields = [f for f in QUANT_FIELDS if df[f].isna().all()]
+
+        return df, None, missing_fields
 
     except Exception as e:
         error_msg = str(e)
         suggestion = get_error_suggestion(ticker, error_msg)
-        return None, suggestion
+        return None, suggestion, list(QUANT_FIELDS)
+
+
+def build_fundamental_file_entry(ticker, date_str, timestamp):
+    """
+    Fetch one ticker and shape it into a single "files" entry.
+
+    Returns a dict whose "status" is:
+      - "success" — parquet built, all pre-screen gate fields usable
+      - "failed"  — no data at all, OR a pre-screen gate field has no usable
+                    value (see PRESCREEN_CRITICAL_FIELDS for why this gates)
+    """
+    df, error, missing_fields = fetch_fundamental_data(ticker)
+
+    if df is None or df.empty:
+        return {
+            "ticker": ticker,
+            "date": date_str,
+            "status": "failed",
+            "error": error or "No fundamental data available",
+            "suggestion": get_error_suggestion(ticker, error or "No data"),
+        }
+
+    missing_set = set(missing_fields)
+    missing_critical = [f for f in PRESCREEN_CRITICAL_FIELDS if f in missing_set]
+
+    if missing_critical:
+        return {
+            "ticker": ticker,
+            "date": date_str,
+            "status": "failed",
+            "error": "Missing pre-screen field(s): " + ", ".join(missing_critical),
+            "suggestion": (
+                f"'{ticker}' returned data but has no usable value for "
+                f"{len(missing_critical)} pre-screen removal-criteria field(s). "
+                "Scoring this ticker could pass a stock the removal criteria "
+                "should reject. Common causes: a non-equity quote type (ETF, "
+                "fund, index), a recent IPO with no full statement history, or "
+                "a financial-sector name where Yahoo omits these line items."
+            ),
+            "missing_critical_fields": missing_critical,
+            "missing_fields": missing_fields,
+            "missing_count": len(missing_fields),
+        }
+
+    buffer = safe_to_parquet(df)
+    file_content = buffer.read()
+    base64_content = base64.b64encode(file_content).decode("utf-8")
+
+    return {
+        "ticker": ticker,
+        "date": date_str,
+        "fetch_date": timestamp,
+        "data_type": "fundamental",
+        "status": "success",
+        "content": base64_content,
+        "size_bytes": len(file_content),
+        "metadata": {
+            "rows": len(df),
+            "columns": len(df.columns),
+            "fields": df.columns.tolist(),
+            "missing_fields": missing_fields,
+            "missing_count": len(missing_fields),
+            "data_sources": [
+                "stock_info", "income_statement", "quarterly_income_statement",
+                "balance_sheet", "quarterly_balance_sheet",
+                "cash_flow", "quarterly_cash_flow",
+            ],
+        },
+    }
 
 
 @app.post("/fundamentals/{ticker}")
 async def get_fundamentals_single(ticker: str):
     """
-    Fetch fundamental data for a single ticker.
-    Returns: JSON with parquet content (base64 encoded)
+    Fetch the 167 Quant Screener fundamental fields for a single ticker.
+    Returns: JSON metadata + parquet content (base64 encoded)
     """
     try:
         ticker = ticker.upper().strip()
@@ -1091,55 +1271,18 @@ async def get_fundamentals_single(ticker: str):
         current_date_str = datetime.now().strftime("%Y-%m-%d")
         current_timestamp = datetime.now().isoformat() + "Z"
 
-        # Fetch fundamental data
-        df, error = fetch_fundamental_data(ticker)
+        entry = build_fundamental_file_entry(ticker, current_date_str, current_timestamp)
 
-        if df is None or df.empty:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "failed",
-                    "count": 1,
-                    "data_type": "fundamental",
-                    "files": [
-                        {
-                            "ticker": ticker,
-                            "status": "failed",
-                            "error": error or "No fundamental data available",
-                            "suggestion": get_error_suggestion(ticker, error or "No data"),
-                            "date": current_date_str
-                        }
-                    ]
-                }
-            )
-
-        # Convert to parquet
-        buffer = safe_to_parquet(df)
-        file_content = buffer.read()
-        base64_content = base64.b64encode(file_content).decode('utf-8')
-
-        return {
-            "status": "success",
-            "count": 1,
-            "data_type": "fundamental",
-            "files": [
-                {
-                    "ticker": ticker,
-                    "date": current_date_str,
-                    "fetch_date": current_timestamp,
-                    "data_type": "fundamental",
-                    "status": "success",
-                    "content": base64_content,
-                    "size_bytes": len(file_content),
-                    "metadata": {
-                        "rows": len(df),
-                        "columns": len(df.columns),
-                        "fields": df.columns.tolist(),
-                        "data_sources": ["stock_info", "income_statement", "balance_sheet", "cash_flow", "quarterly_statements"]
-                    }
-                }
-            ]
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": entry["status"],
+                "count": 1,
+                "data_type": "fundamental",
+                "field_count": len(QUANT_FIELDS),
+                "files": [entry],
+            },
+        )
 
     except HTTPException:
         raise
@@ -1150,10 +1293,10 @@ async def get_fundamentals_single(ticker: str):
 @app.post("/fundamentals")
 async def get_fundamentals_batch(request: Request):
     """
-    Fetch fundamental data for multiple tickers (batch).
+    Fetch the 167 Quant Screener fundamental fields for multiple tickers.
     Body: {"tickers": ["AAPL", "TSLA", ...]}
     Max 100 tickers per request.
-    Returns: JSON with status for each ticker
+    Returns: JSON with a per-ticker status, one parquet per ticker.
     """
     try:
         data = await request.json()
@@ -1164,73 +1307,58 @@ async def get_fundamentals_batch(request: Request):
 
         # Normalize tickers
         if isinstance(tickers_input, str):
-            tickers = [t.strip().upper() for t in tickers_input.split(",")]
+            raw = tickers_input.split(",")
         elif isinstance(tickers_input, list):
-            tickers = [str(t).strip().upper() for t in tickers_input]
+            raw = tickers_input
         else:
             raise HTTPException(status_code=400, detail="Tickers must be string or array")
 
-        # Max 100 tickers
+        # Dedupe while preserving the caller's order, so the response "files"
+        # array lines up with the order the tickers were sent in.
+        tickers = []
+        seen = set()
+        for item in raw:
+            symbol = str(item).strip().upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                tickers.append(symbol)
+
+        if not tickers:
+            raise HTTPException(status_code=400, detail="No valid tickers provided")
+
         if len(tickers) > 100:
             raise HTTPException(status_code=400, detail="Maximum 100 tickers per request")
 
-        tickers = list(set(tickers))  # Remove duplicates
-        ticker_files = []
         current_date_str = datetime.now().strftime("%Y-%m-%d")
         current_timestamp = datetime.now().isoformat() + "Z"
 
+        results = {}
         max_workers = min(10, len(tickers))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {executor.submit(fetch_fundamental_data, t): t for t in tickers}
+            future_to_ticker = {
+                executor.submit(
+                    build_fundamental_file_entry, t, current_date_str, current_timestamp
+                ): t
+                for t in tickers
+            }
 
             for future in as_completed(future_to_ticker):
                 ticker = future_to_ticker[future]
-
                 try:
-                    df, error = future.result()
-
-                    if df is not None and not df.empty:
-                        # Success
-                        buffer = safe_to_parquet(df)
-                        file_content = buffer.read()
-                        base64_content = base64.b64encode(file_content).decode('utf-8')
-
-                        ticker_files.append({
-                            "ticker": ticker,
-                            "date": current_date_str,
-                            "fetch_date": current_timestamp,
-                            "data_type": "fundamental",
-                            "status": "success",
-                            "content": base64_content,
-                            "size_bytes": len(file_content),
-                            "metadata": {
-                                "rows": len(df),
-                                "columns": len(df.columns),
-                                "fields": df.columns.tolist(),
-                                "data_sources": ["stock_info", "income_statement", "balance_sheet", "cash_flow"]
-                            }
-                        })
-                    else:
-                        # Failed
-                        ticker_files.append({
-                            "ticker": ticker,
-                            "date": current_date_str,
-                            "status": "failed",
-                            "error": error or "No fundamental data available",
-                            "suggestion": get_error_suggestion(ticker, error or "No data")
-                        })
-
+                    results[ticker] = future.result()
                 except Exception as e:
-                    ticker_files.append({
+                    print(f"Error building fundamentals for {ticker}: {e}")
+                    results[ticker] = {
                         "ticker": ticker,
                         "date": current_date_str,
                         "status": "failed",
                         "error": str(e),
-                        "suggestion": get_error_suggestion(ticker, str(e))
-                    })
+                        "suggestion": get_error_suggestion(ticker, str(e)),
+                    }
 
-        # Count successes and failures
+        ticker_files = [results[t] for t in tickers]
+
         success_count = sum(1 for f in ticker_files if f.get("status") == "success")
         failed_count = len(ticker_files) - success_count
 
@@ -1238,12 +1366,16 @@ async def get_fundamentals_batch(request: Request):
             "status": "completed",
             "count": len(ticker_files),
             "data_type": "fundamental",
+            "field_count": len(QUANT_FIELDS),
             "summary": {
                 "total": len(ticker_files),
                 "success": success_count,
-                "failed": failed_count
+                "failed": failed_count,
+                "failed_tickers": [
+                    f["ticker"] for f in ticker_files if f.get("status") == "failed"
+                ],
             },
-            "files": ticker_files
+            "files": ticker_files,
         }
 
     except HTTPException:
