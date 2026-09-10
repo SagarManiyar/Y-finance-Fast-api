@@ -1070,99 +1070,6 @@ _FUNDAMENTAL_SOURCES = [
 
 _QUANT_FIELDS_SET = set(QUANT_FIELDS)
 
-# ---------------------------------------------------------------------------
-# Period-slot layout
-# ---------------------------------------------------------------------------
-# Each statement field is flattened into a fixed number of period slots, so
-# every ticker's parquet has an identical column set and 100 files concatenate
-# without reconciliation. Slot 1 is ALWAYS the most recent period.
-#
-#   annual   -> <field>_fy1 .. _fy5   + <field>_fyN_date
-#   quarterly-> <field>_q1  .. _q8    + <field>_qN_date
-#   info_*   -> unchanged, point-in-time snapshot, no suffix
-#
-# Slot counts are headroom over what Yahoo actually returned in testing:
-# annual 4-5 periods, quarterly 5-7. If a statement ever returns MORE periods
-# than there are slots, the surplus is dropped and a warning is logged rather
-# than silently discarded.
-ANNUAL_SLOTS = 5
-QUARTERLY_SLOTS = 8
-
-# Quarterly prefixes MUST be tested before annual ones: "quarterly_income_X"
-# also matches nothing in the annual list, but keeping the order explicit
-# prevents a future prefix edit from silently mis-bucketing a field.
-_QUARTERLY_PREFIXES = ("quarterly_income_", "quarterly_balance_", "quarterly_cashflow_")
-_ANNUAL_PREFIXES = ("income_", "balance_", "cashflow_")
-
-
-def _field_kind(field):
-    """Classify a spec field as 'info', 'quarterly' or 'annual'."""
-    if field.startswith("info_"):
-        return "info"
-    if field.startswith(_QUARTERLY_PREFIXES):
-        return "quarterly"
-    if field.startswith(_ANNUAL_PREFIXES):
-        return "annual"
-    raise ValueError(f"unrecognised field prefix: {field}")
-
-
-def _slot_spec(kind):
-    """(slot_count, suffix_tag) for a field kind."""
-    if kind == "quarterly":
-        return QUARTERLY_SLOTS, "q"
-    return ANNUAL_SLOTS, "fy"
-
-
-def _expand_quant_columns():
-    """
-    Build the full flattened column list, once, in spec order.
-
-    Value and date columns are interleaved (value, its date, next value, ...)
-    so related columns sit next to each other when eyeballing the file.
-    """
-    columns = []
-    for field in QUANT_FIELDS:
-        kind = _field_kind(field)
-        if kind == "info":
-            columns.append(field)
-            continue
-        slots, tag = _slot_spec(kind)
-        for slot in range(1, slots + 1):
-            columns.append(f"{field}_{tag}{slot}")
-            columns.append(f"{field}_{tag}{slot}_date")
-    return columns
-
-
-# The parquet's exact column order. Same for every ticker, every refresh.
-QUANT_PARQUET_COLUMNS = _expand_quant_columns()
-
-# Which yfinance accessor each field's periods come from, so a field can find
-# its own statement's period-end dates.
-_FIELD_TO_ACCESSOR = {}
-for _f in QUANT_FIELDS:
-    for _prefix, _accessor in _FUNDAMENTAL_SOURCES:
-        if _f.startswith(_prefix):
-            _FIELD_TO_ACCESSOR[_f] = _accessor
-            break
-
-
-def _is_blank(value):
-    """
-    True when a value carries no usable information.
-
-    Matches pandas isna semantics (None / NaN / NaT), so missing counts stay
-    comparable with the earlier row-shaped extract. Note an empty string is
-    NOT treated as blank, same as pandas.
-    """
-    if value is None:
-        return True
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        # Non-scalar (list / dict) — Yahoo returns these for a few info keys.
-        # Not one of our 167, but treat as present rather than crashing.
-        return False
-
 
 def get_error_suggestion(ticker, error_msg):
     """Generate error suggestions based on error message."""
@@ -1184,30 +1091,27 @@ def fetch_fundamental_data(ticker):
 
     Returns tuple: (data_df, error_msg, missing_fields)
 
-    Output shape — EXACTLY ONE ROW per ticker, period-flattened:
-      - info_*    -> one column, unsuffixed (point-in-time snapshot)
-      - annual    -> <field>_fy1 .. _fy5, each with a <field>_fyN_date column
-      - quarterly -> <field>_q1  .. _q8,  each with a <field>_qN_date column
+    Output shape — identical to the earlier full-field extract, just narrowed:
+      - Exactly 167 columns, in QUANT_FIELDS order. Fields Yahoo does not
+        return are still present, filled with null, so every ticker's parquet
+        has the same schema and 100 files concatenate without reconciliation.
+      - One row per fiscal period, ordinally aligned: row 0 = most recent
+        period, row 1 = next most recent, etc. Row count = the longest
+        statement returned for that ticker (4-7 in testing).
+      - info_* are point-in-time snapshots, so they carry a value on row 0
+        and null on rows 1+.
 
-    Slot 1 is ALWAYS the most recent period. Slots are fixed and null-padded,
-    so every ticker has an identical column set regardless of how many periods
-    Yahoo returned. Column order is QUANT_PARQUET_COLUMNS.
-
-    Because annual and quarterly statements have different period-end dates,
-    each slot carries its own date column — so "_fy1_date" and "_q1_date" on
-    the same row are different dates, and both are readable from the parquet
-    alone with no external lookup.
-
-    missing_fields is reported against the 167 BASE field names (not the
-    expanded column names): a field is missing when every one of its slots is
-    null, which is what the pre-screen gate needs to know.
+    NOTE on ordinal alignment: annual and quarterly statements have different
+    period-end dates and different lengths, so row 1 of an "income_*" column
+    and row 1 of a "quarterly_income_*" column are DIFFERENT dates. This
+    extract carries no period-end date columns, so the dates are not
+    recoverable from the parquet alone.
     """
     try:
         stock = yf.Ticker(ticker)
 
-        snapshot = {}      # info_* -> single scalar value
-        series = {}        # statement field -> array, one value per period slot
-        stmt_dates = {}    # accessor -> ["YYYY-MM-DD", ...] in slot order
+        snapshot = {}   # info_* -> single scalar value
+        series = {}     # statement fields -> array, one value per fiscal period
 
         # --- 1. Stock info (snapshot) ---
         try:
@@ -1231,26 +1135,13 @@ def fetch_fundamental_data(ticker):
                 continue
 
             # Yahoo returns period columns most-recent-first today, but nothing
-            # in the API guarantees that. Sort explicitly descending so slot 1
-            # is genuinely the newest period — otherwise every CAGR / YoY delta
-            # computed downstream silently inverts sign with no visible error.
+            # in the API guarantees that. Sort explicitly descending: row 0 MUST
+            # be the most recent period, or every CAGR / YoY delta computed
+            # downstream silently inverts sign with no visible error.
             try:
                 stmt = stmt.reindex(columns=sorted(stmt.columns, reverse=True))
             except TypeError:
                 pass  # unorderable column labels — keep Yahoo's own order
-
-            # Surface truncation rather than dropping periods silently.
-            slots, _tag = _slot_spec(
-                "quarterly" if accessor.startswith("quarterly") else "annual"
-            )
-            if stmt.shape[1] > slots:
-                print(
-                    f"Warning: {ticker} {accessor} returned {stmt.shape[1]} periods "
-                    f"but only {slots} slots exist — dropping the oldest "
-                    f"{stmt.shape[1] - slots}. Raise ANNUAL_SLOTS/QUARTERLY_SLOTS."
-                )
-
-            stmt_dates[accessor] = [str(c)[:10] for c in stmt.columns]
 
             # Index positionally rather than by label: Yahoo occasionally
             # repeats a line-item label, and .loc on a duplicate label returns
@@ -1263,47 +1154,30 @@ def fetch_fundamental_data(ticker):
         if not snapshot and not series:
             return None, get_error_suggestion(ticker, "No fundamental data found"), list(QUANT_FIELDS)
 
-        # --- Flatten into a single row across the fixed slot layout ---
-        row = {}
-        missing_fields = []
+        # Row count = longest statement actually returned for this ticker.
+        max_len = max((len(arr) for arr in series.values()), default=1) or 1
 
+        # Build every one of the 167 columns, in spec order, padding to max_len.
+        columns = {}
         for field in QUANT_FIELDS:
-            kind = _field_kind(field)
+            if field in series:
+                values = list(series[field])[:max_len]
+                values += [None] * (max_len - len(values))
+            elif field in snapshot:
+                values = [snapshot[field]] + [None] * (max_len - 1)
+            else:
+                values = [None] * max_len
+            columns[field] = values
 
-            if kind == "info":
-                value = snapshot.get(field)
-                row[field] = value
-                if _is_blank(value):
-                    missing_fields.append(field)
-                continue
-
-            slots, tag = _slot_spec(kind)
-            values = series.get(field)
-            dates = stmt_dates.get(_FIELD_TO_ACCESSOR[field], [])
-            has_value = False
-
-            for slot in range(1, slots + 1):
-                idx = slot - 1
-                value = values[idx] if values is not None and idx < len(values) else None
-                # A slot's date comes from its statement, so it is present even
-                # when this particular line item is empty for that period —
-                # which is exactly how you tell "no such period" from
-                # "period exists, Yahoo has no value for this field".
-                date = dates[idx] if idx < len(dates) else None
-
-                row[f"{field}_{tag}{slot}"] = value
-                row[f"{field}_{tag}{slot}_date"] = date
-
-                if not _is_blank(value):
-                    has_value = True
-
-            if not has_value:
-                missing_fields.append(field)
-
-        df = pd.DataFrame([row], columns=QUANT_PARQUET_COLUMNS)
+        df = pd.DataFrame(columns, columns=QUANT_FIELDS)
 
         if df.empty:
             return None, get_error_suggestion(ticker, "Empty fundamental data"), list(QUANT_FIELDS)
+
+        # A field counts as missing when it has no usable value at all — either
+        # Yahoo never returned it, or returned it as null. Both are unusable
+        # downstream, and the pre-screen gate needs to treat them the same.
+        missing_fields = [f for f in QUANT_FIELDS if df[f].isna().all()]
 
         return df, None, missing_fields
 
@@ -1370,11 +1244,6 @@ def build_fundamental_file_entry(ticker, date_str, timestamp):
         "metadata": {
             "rows": len(df),
             "columns": len(df.columns),
-            # Base spec fields (167) vs the flattened column count they expand
-            # to once each statement field is split across its period slots.
-            "base_field_count": len(QUANT_FIELDS),
-            "annual_slots": ANNUAL_SLOTS,
-            "quarterly_slots": QUARTERLY_SLOTS,
             "fields": df.columns.tolist(),
             "missing_fields": missing_fields,
             "missing_count": len(missing_fields),
