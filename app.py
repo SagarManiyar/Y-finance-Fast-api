@@ -1057,18 +1057,34 @@ PRESCREEN_CRITICAL_FIELDS = [
     "income_Interest Expense",  # interest coverage
 ]
 
-# Prefix -> yfinance accessor. LONGEST PREFIX FIRST so that, for example,
-# "quarterly_income_*" is never mis-bucketed into the annual "income_*" source.
-_FUNDAMENTAL_SOURCES = [
-    ("quarterly_income_", "quarterly_income_stmt"),
-    ("quarterly_balance_", "quarterly_balance_sheet"),
-    ("quarterly_cashflow_", "quarterly_cashflow"),
+# Sources split by period type, income -> balance -> cashflow priority order.
+# Whichever of the three is fetched first (per period type) sets the canonical
+# period-end dates for that output file — see _build_period_dataframe.
+_ANNUAL_SOURCES = [
     ("income_", "income_stmt"),
     ("balance_", "balance_sheet"),
     ("cashflow_", "cashflow"),
 ]
+_QUARTERLY_SOURCES = [
+    ("quarterly_income_", "quarterly_income_stmt"),
+    ("quarterly_balance_", "quarterly_balance_sheet"),
+    ("quarterly_cashflow_", "quarterly_cashflow"),
+]
+_ANNUAL_PREFIXES = tuple(p for p, _ in _ANNUAL_SOURCES)
+_QUARTERLY_PREFIXES = tuple(p for p, _ in _QUARTERLY_SOURCES)
 
-_QUANT_FIELDS_SET = set(QUANT_FIELDS)
+# QUANT_FIELDS split into the 3 output files (info / yearly / quarterly).
+# Order within each list is preserved from QUANT_FIELDS. Approved 2026-09-11:
+# same 167 fields as before, reshaped into 3 files + real period-end dates —
+# no fields added or removed.
+INFO_FIELDS = [
+    f for f in QUANT_FIELDS
+    if not f.startswith(_ANNUAL_PREFIXES) and not f.startswith(_QUARTERLY_PREFIXES)
+]
+YEARLY_FIELDS = [f for f in QUANT_FIELDS if f.startswith(_ANNUAL_PREFIXES)]
+QUARTERLY_FIELDS = [f for f in QUANT_FIELDS if f.startswith(_QUARTERLY_PREFIXES)]
+
+_INFO_FIELDS_SET = set(INFO_FIELDS)
 
 
 def get_error_suggestion(ticker, error_msg):
@@ -1085,120 +1101,182 @@ def get_error_suggestion(ticker, error_msg):
         return f"Unable to fetch fundamental data for '{ticker}'. Verify ticker symbol and try again."
 
 
+def _fiscal_year_label(ts):
+    return f"FY{ts.year}"
+
+
+def _fiscal_quarter_label(ts):
+    # Calendar quarter of the period-end date. yfinance does not expose the
+    # company's own fiscal-quarter numbering, so this is a readable label,
+    # not a claim about the company's internal fiscal calendar.
+    return f"Q{ts.quarter} {ts.year}"
+
+
+def _build_period_dataframe(stock, ticker, sources, fields, date_col, label_col, label_fn):
+    """
+    Build the yearly or quarterly DataFrame for one ticker.
+
+    Fetches each statement in `sources` (priority order: income, then balance,
+    then cashflow). The FIRST one that returns data sets the canonical
+    period-end dates (its column labels, sorted most-recent-first) for every
+    row in this file — row 0 = most recent period. Every other statement's
+    line items are then read positionally against that same axis.
+
+    This assumes yfinance's income/balance/cashflow statements share fiscal
+    period boundaries for a given ticker (held for tickers tested against
+    QUANT_FIELDS). If a later statement is longer than the canonical one, its
+    extra oldest columns are dropped; if shorter, its missing rows are left
+    null — same truncation/padding behavior as the original single-file
+    extract, now with real dates attached instead of bare ordinal rows.
+
+    Returns (df, series) where `series` is the raw per-field arrays, used by
+    the caller only to compute missing_fields. Returns (None, {}) if none of
+    the statements returned any data.
+    """
+    series = {}
+    period_dates = None
+
+    for prefix, accessor in sources:
+        try:
+            stmt = getattr(stock, accessor)
+        except Exception as e:
+            print(f"Warning: could not fetch {accessor} for {ticker}: {e}")
+            continue
+
+        if not isinstance(stmt, pd.DataFrame) or stmt.empty:
+            continue
+
+        # Yahoo returns period columns most-recent-first today, but nothing
+        # in the API guarantees that. Sort explicitly descending: row 0 MUST
+        # be the most recent period, or every CAGR / YoY delta computed
+        # downstream silently inverts sign with no visible error.
+        try:
+            stmt = stmt.reindex(columns=sorted(stmt.columns, reverse=True))
+        except TypeError:
+            pass  # unorderable column labels — keep Yahoo's own order
+
+        if period_dates is None:
+            period_dates = list(stmt.columns)
+
+        # Index positionally rather than by label: Yahoo occasionally repeats
+        # a line-item label, and .loc on a duplicate label returns a
+        # DataFrame instead of a Series. First occurrence wins.
+        for pos, label in enumerate(stmt.index):
+            field = prefix + str(label)
+            if field in fields and field not in series:
+                series[field] = stmt.iloc[pos].to_numpy()
+
+    if period_dates is None:
+        return None, series
+
+    max_len = len(period_dates)
+    columns = {
+        "ticker": [ticker] * max_len,
+        date_col: [pd.Timestamp(d).strftime("%Y-%m-%d") for d in period_dates],
+        label_col: [label_fn(pd.Timestamp(d)) for d in period_dates],
+    }
+    for field in fields:
+        if field in series:
+            values = list(series[field])[:max_len]
+            values += [None] * (max_len - len(values))
+        else:
+            values = [None] * max_len
+        columns[field] = values
+
+    df = pd.DataFrame(columns, columns=["ticker", date_col, label_col] + fields)
+    return df, series
+
+
 def fetch_fundamental_data(ticker):
     """
-    Fetch the 167 Quant Screener fundamental fields for a ticker.
+    Fetch fundamental data for a ticker, split into 3 shapes:
+      - info_df:      1 row.  ticker + 109 info_* snapshot fields.
+      - yearly_df:    1 row per fiscal year, most-recent first.  ticker +
+                       fiscal_year_end_date + fiscal_year + 43 annual fields.
+      - quarterly_df: 1 row per fiscal quarter, most-recent first.  ticker +
+                       fiscal_quarter_end_date + fiscal_quarter + 15
+                       quarterly fields.
 
-    Returns tuple: (data_df, error_msg, missing_fields)
+    Returns tuple: (info_df, yearly_df, quarterly_df, error_msg, missing_fields)
 
-    Output shape — identical to the earlier full-field extract, just narrowed:
-      - Exactly 167 columns, in QUANT_FIELDS order. Fields Yahoo does not
-        return are still present, filled with null, so every ticker's parquet
-        has the same schema and 100 files concatenate without reconciliation.
-      - One row per fiscal period, ordinally aligned: row 0 = most recent
-        period, row 1 = next most recent, etc. Row count = the longest
-        statement returned for that ticker (4-7 in testing).
-      - info_* are point-in-time snapshots, so they carry a value on row 0
-        and null on rows 1+.
-
-    NOTE on ordinal alignment: annual and quarterly statements have different
-    period-end dates and different lengths, so row 1 of an "income_*" column
-    and row 1 of a "quarterly_income_*" column are DIFFERENT dates. This
-    extract carries no period-end date columns, so the dates are not
-    recoverable from the parquet alone.
+    missing_fields is computed across all 167 QUANT_FIELDS combined (same
+    semantics as the original single-file extract: a field counts as missing
+    when it has no usable value anywhere), so PRESCREEN_CRITICAL_FIELDS gating
+    keeps working the same way regardless of which of the 3 files a field now
+    lives in.
     """
     try:
         stock = yf.Ticker(ticker)
 
-        snapshot = {}   # info_* -> single scalar value
-        series = {}     # statement fields -> array, one value per fiscal period
-
-        # --- 1. Stock info (snapshot) ---
+        # --- Info snapshot ---
+        info_values = {}
         try:
             info = stock.info or {}
             for key, value in info.items():
                 field = "info_" + key
-                if field in _QUANT_FIELDS_SET:
-                    snapshot[field] = value
+                if field in _INFO_FIELDS_SET:
+                    info_values[field] = value
         except Exception as e:
             print(f"Warning: could not fetch info for {ticker}: {e}")
 
-        # --- 2-7. Annual + quarterly income / balance / cashflow (series) ---
-        for prefix, accessor in _FUNDAMENTAL_SOURCES:
-            try:
-                stmt = getattr(stock, accessor)
-            except Exception as e:
-                print(f"Warning: could not fetch {accessor} for {ticker}: {e}")
-                continue
+        info_row = {"ticker": ticker}
+        for field in INFO_FIELDS:
+            info_row[field] = info_values.get(field)
+        info_df = pd.DataFrame([info_row], columns=["ticker"] + INFO_FIELDS)
 
-            if not isinstance(stmt, pd.DataFrame) or stmt.empty:
-                continue
+        # --- Yearly & quarterly series ---
+        yearly_df, yearly_series = _build_period_dataframe(
+            stock, ticker, _ANNUAL_SOURCES, YEARLY_FIELDS,
+            "fiscal_year_end_date", "fiscal_year", _fiscal_year_label,
+        )
+        quarterly_df, quarterly_series = _build_period_dataframe(
+            stock, ticker, _QUARTERLY_SOURCES, QUARTERLY_FIELDS,
+            "fiscal_quarter_end_date", "fiscal_quarter", _fiscal_quarter_label,
+        )
 
-            # Yahoo returns period columns most-recent-first today, but nothing
-            # in the API guarantees that. Sort explicitly descending: row 0 MUST
-            # be the most recent period, or every CAGR / YoY delta computed
-            # downstream silently inverts sign with no visible error.
-            try:
-                stmt = stmt.reindex(columns=sorted(stmt.columns, reverse=True))
-            except TypeError:
-                pass  # unorderable column labels — keep Yahoo's own order
+        if not info_values and yearly_df is None and quarterly_df is None:
+            return None, None, None, get_error_suggestion(ticker, "No fundamental data found"), list(QUANT_FIELDS)
 
-            # Index positionally rather than by label: Yahoo occasionally
-            # repeats a line-item label, and .loc on a duplicate label returns
-            # a DataFrame instead of a Series. First occurrence wins.
-            for pos, label in enumerate(stmt.index):
-                field = prefix + str(label)
-                if field in _QUANT_FIELDS_SET and field not in series:
-                    series[field] = stmt.iloc[pos].to_numpy()
-
-        if not snapshot and not series:
-            return None, get_error_suggestion(ticker, "No fundamental data found"), list(QUANT_FIELDS)
-
-        # Row count = longest statement actually returned for this ticker.
-        max_len = max((len(arr) for arr in series.values()), default=1) or 1
-
-        # Build every one of the 167 columns, in spec order, padding to max_len.
-        columns = {}
-        for field in QUANT_FIELDS:
-            if field in series:
-                values = list(series[field])[:max_len]
-                values += [None] * (max_len - len(values))
-            elif field in snapshot:
-                values = [snapshot[field]] + [None] * (max_len - 1)
-            else:
-                values = [None] * max_len
-            columns[field] = values
-
-        df = pd.DataFrame(columns, columns=QUANT_FIELDS)
-
-        if df.empty:
-            return None, get_error_suggestion(ticker, "Empty fundamental data"), list(QUANT_FIELDS)
+        if yearly_df is None:
+            yearly_df = pd.DataFrame(columns=["ticker", "fiscal_year_end_date", "fiscal_year"] + YEARLY_FIELDS)
+        if quarterly_df is None:
+            quarterly_df = pd.DataFrame(columns=["ticker", "fiscal_quarter_end_date", "fiscal_quarter"] + QUARTERLY_FIELDS)
 
         # A field counts as missing when it has no usable value at all — either
         # Yahoo never returned it, or returned it as null. Both are unusable
         # downstream, and the pre-screen gate needs to treat them the same.
-        missing_fields = [f for f in QUANT_FIELDS if df[f].isna().all()]
+        missing_fields = []
+        for field in INFO_FIELDS:
+            if pd.isna(info_values.get(field)):
+                missing_fields.append(field)
+        for field in YEARLY_FIELDS:
+            if pd.isna(pd.Series(yearly_series.get(field, [None]))).all():
+                missing_fields.append(field)
+        for field in QUARTERLY_FIELDS:
+            if pd.isna(pd.Series(quarterly_series.get(field, [None]))).all():
+                missing_fields.append(field)
 
-        return df, None, missing_fields
+        return info_df, yearly_df, quarterly_df, None, missing_fields
 
     except Exception as e:
         error_msg = str(e)
         suggestion = get_error_suggestion(ticker, error_msg)
-        return None, suggestion, list(QUANT_FIELDS)
+        return None, None, None, suggestion, list(QUANT_FIELDS)
 
 
 def build_fundamental_file_entry(ticker, date_str, timestamp):
     """
-    Fetch one ticker and shape it into a single "files" entry.
+    Fetch one ticker and shape it into a "files" entry containing the 3
+    fundamental parquet files (info / yearly / quarterly) as base64.
 
     Returns a dict whose "status" is:
-      - "success" — parquet built, all pre-screen gate fields usable
+      - "success" — all 3 parquet files built, all pre-screen gate fields usable
       - "failed"  — no data at all, OR a pre-screen gate field has no usable
                     value (see PRESCREEN_CRITICAL_FIELDS for why this gates)
     """
-    df, error, missing_fields = fetch_fundamental_data(ticker)
+    info_df, yearly_df, quarterly_df, error, missing_fields = fetch_fundamental_data(ticker)
 
-    if df is None or df.empty:
+    if info_df is None:
         return {
             "ticker": ticker,
             "date": date_str,
@@ -1229,22 +1307,29 @@ def build_fundamental_file_entry(ticker, date_str, timestamp):
             "missing_count": len(missing_fields),
         }
 
-    buffer = safe_to_parquet(df)
-    file_content = buffer.read()
-    base64_content = base64.b64encode(file_content).decode("utf-8")
+    def _to_file(df, data_type):
+        buffer = safe_to_parquet(df)
+        content = buffer.read()
+        return {
+            "data_type": data_type,
+            "content": base64.b64encode(content).decode("utf-8"),
+            "size_bytes": len(content),
+            "rows": len(df),
+            "columns": len(df.columns),
+            "fields": df.columns.tolist(),
+        }
 
     return {
         "ticker": ticker,
         "date": date_str,
         "fetch_date": timestamp,
-        "data_type": "fundamental",
         "status": "success",
-        "content": base64_content,
-        "size_bytes": len(file_content),
+        "files": {
+            "info": _to_file(info_df, "fundamental_info"),
+            "yearly": _to_file(yearly_df, "fundamental_yearly"),
+            "quarterly": _to_file(quarterly_df, "fundamental_quarterly"),
+        },
         "metadata": {
-            "rows": len(df),
-            "columns": len(df.columns),
-            "fields": df.columns.tolist(),
             "missing_fields": missing_fields,
             "missing_count": len(missing_fields),
             "data_sources": [
