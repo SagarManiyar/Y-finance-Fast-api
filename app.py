@@ -893,6 +893,169 @@ def fetch_5y_data(ticker):
         print(f"Error fetching {ticker}: {e}")
         return None
 
+# ===========================
+# /history-range endpoint
+# ===========================
+# Same shape as /history-5y, but the window is given explicitly instead of
+# being period="5y" relative to today.
+#
+# WHY THIS EXISTS
+# /history-5y always asks yfinance for "today minus 5 years", so the window
+# slides forward every night. Re-fetching a ticker with it would drop the
+# oldest rows already in that ticker's parquet. Laravel instead reads the
+# FIRST row's date out of the existing parquet and passes it as start_date,
+# so the file's original beginning is preserved and only real gaps are filled.
+#
+# Columns match fetch_5y_data (OHLCV + PreviousClose) plus Ticker, which the
+# per-ticker parquet already carries. Indicator columns are deliberately NOT
+# computed here: Laravel triggers /technical-indicators-recalculate after the
+# merge, because merging rows without indicator columns nulls them for every
+# overlapping date (check_and_upsert_s3 dedupes with keep='last').
+#
+# Body:  {"tickers": ["AAPL"], "start_date": "2020-09-16", "end_date": "2026-09-15"}
+# Both dates are INCLUSIVE. end_date is pushed out by a day before it reaches
+# yfinance, whose `end` is exclusive.
+def fetch_range_data(ticker, start_date, end_date):
+    try:
+        stock = yf.Ticker(ticker)
+
+        # yfinance treats `end` as exclusive — add a day so end_date is included.
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+
+        df = stock.history(
+            start=start_date,
+            end=end_dt.strftime("%Y-%m-%d"),
+            interval="1d",
+        )
+
+        if df.empty:
+            return None
+
+        df = df.reset_index()
+        df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+
+        # Same guard as fetch_5y_data — today's row may be mid-session.
+        df = _exclude_today(df, 'Date')
+
+        if df.empty:
+            return None
+
+        df["PreviousClose"] = df["Close"].shift(1)
+
+        # The per-ticker parquet carries Ticker (split_and_update writes it).
+        # Without it every backfilled row would merge in with a null Ticker,
+        # which build_signals in fetch_parquet.py reads back.
+        df["Ticker"] = ticker
+
+        return df
+
+    except Exception as e:
+        print(f"Error fetching range for {ticker}: {e}")
+        return None
+
+
+@app.post("/history-range")
+async def history_range(request: Request):
+    try:
+        data    = await request.json()
+        tickers = normalize_tickers_input(data)
+
+        if not tickers:
+            raise HTTPException(status_code=400, detail="Tickers are required")
+
+        start_date = data.get("start_date")
+        end_date   = data.get("end_date")
+
+        if not start_date or not end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="start_date and end_date are required (YYYY-MM-DD)",
+            )
+
+        for label, value in (("start_date", start_date), ("end_date", end_date)):
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid {label} '{value}'. Use YYYY-MM-DD.",
+                )
+
+        if start_date > end_date:
+            raise HTTPException(
+                status_code=400,
+                detail=f"start_date ({start_date}) is after end_date ({end_date})",
+            )
+
+        ticker_files     = []
+        errors           = []
+        max_workers      = min(4, len(tickers))
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {
+                executor.submit(fetch_range_data, t, start_date, end_date): t
+                for t in tickers
+            }
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    errors.append({"ticker": ticker, "error": str(exc)})
+                    continue
+
+                if not isinstance(res, pd.DataFrame) or res.empty:
+                    # No trading days in this window for this ticker. Not an
+                    # error — Laravel uses this to stop re-checking a gap that
+                    # is really just a holiday or a suspended listing.
+                    errors.append({
+                        "ticker": ticker,
+                        "error":  "No trading days returned for the requested range",
+                    })
+                    continue
+
+                buffer         = safe_to_parquet(res)
+                file_content   = buffer.read()
+                base64_content = base64.b64encode(file_content).decode('utf-8')
+
+                ticker_files.append({
+                    "ticker":     ticker,
+                    "date":       current_date_str,
+                    "data_type":  "technical",
+                    "period":     f"{start_date}..{end_date}",
+                    "content":    base64_content,
+                    "size_bytes": len(file_content),
+                    # Metadata so Laravel knows what it actually got back
+                    # without having to parse the Parquet itself.
+                    "rows":       len(res),
+                    "first_date": str(res["Date"].iloc[0])[:10],
+                    "last_date":  str(res["Date"].iloc[-1])[:10],
+                })
+
+        if not ticker_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No data found for any ticker between {start_date} and {end_date}",
+            )
+
+        return {
+            "status":         "success",
+            "count":          len(ticker_files),
+            "data_type":      "technical",
+            "start_date":     start_date,
+            "end_date":       end_date,
+            "files":          ticker_files,
+            "tickers_failed": len(errors),
+            **({"errors": errors} if errors else {}),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+
 @app.post("/history-5y")
 async def history_5y(request: Request):
     try:
