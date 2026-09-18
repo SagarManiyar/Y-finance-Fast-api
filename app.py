@@ -377,8 +377,31 @@ async def companies(request: Request):
 
 
 # ===========================
-# Yesterday data helpers — UNCHANGED
+# Yesterday data helpers
 # ===========================
+# FIX: reject rows whose OHLC is null even when Volume is present.
+#
+# yfinance's price and volume pipelines are separate. When the price side
+# hasn't finalized a session yet, Open/High/Low/Close come back NaN while
+# Volume is already populated. float(nan) does NOT raise, so without this
+# check such a row was recorded as a normal, successful result and written
+# straight into the ticker's parquet with null prices — two real AAPL
+# sessions (2026-09-16 and 2026-09-17) were written this way.
+#
+# Used by fetch_yesterday_data() and fetch_range_data() below.
+def _ohlc_is_valid(row):
+    for field in ("Open", "High", "Low", "Close"):
+        val = row.get(field)
+        if val is None:
+            return False
+        try:
+            if pd.isna(val):
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
 def fetch_yesterday_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -395,6 +418,20 @@ def fetch_yesterday_data(ticker):
         else:
             row         = hist.iloc[-1]
             target_date = hist.index[-1]
+
+        # See _ohlc_is_valid() above. Returning an error here — instead of a
+        # "successful" record full of NaN — makes this ticker MISSING from the
+        # combined /yesterday result. That is a state Laravel already handles:
+        # DailyUploadJob's missing-ticker detection marks it failed and queues
+        # RetreyTickerJob, which tries again shortly, then again later, exactly
+        # as it already does for a delisted symbol or an exchange holiday.
+        if not _ohlc_is_valid(row):
+            return {
+                "error": (
+                    f"'{ticker}' has no OHLC for {target_date.strftime('%Y-%m-%d')} yet "
+                    f"(Volume present, prices null) — source has not finalized this session"
+                )
+            }
 
         return {
             "Date":         target_date.strftime("%Y-%m-%d"),
@@ -903,8 +940,11 @@ def fetch_5y_data(ticker):
 # /history-5y always asks yfinance for "today minus 5 years", so the window
 # slides forward every night. Re-fetching a ticker with it would drop the
 # oldest rows already in that ticker's parquet. Laravel instead reads the
-# FIRST row's date out of the existing parquet and passes it as start_date,
-# so the file's original beginning is preserved and only real gaps are filled.
+# LAST row's date that actually has OHLCV out of the existing parquet and
+# passes it as start_date, so only the missing days are re-fetched — an
+# earlier version anchored to the FIRST row, which re-fetched a ticker's
+# entire history to add a day or two (see the INDICATORS note below for why
+# that was expensive).
 #
 # Columns match fetch_5y_data (OHLCV + PreviousClose) plus Ticker, which the
 # per-ticker parquet already carries. Indicator columns are deliberately NOT
@@ -936,6 +976,23 @@ def fetch_range_data(ticker, start_date, end_date):
 
         # Same guard as fetch_5y_data — today's row may be mid-session.
         df = _exclude_today(df, 'Date')
+
+        if df.empty:
+            return None
+
+        # FIX: drop any row whose OHLC is null even though Volume is present.
+        # Same yfinance quirk as fetch_yesterday_data (see _ohlc_is_valid) —
+        # without this, a shell row for a not-yet-finalized session would merge
+        # into the parquet and OVERWRITE a perfectly good existing row for that
+        # date (check_and_upsert_s3 dedupes on Date with keep='last'). Dropping
+        # it here instead leaves that date simply absent from this response, so
+        # the caller's gap check still sees it as missing and tries again on a
+        # later run, once the source actually has real data for it.
+        rows_before = len(df)
+        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'], how='any')
+        dropped = rows_before - len(df)
+        if dropped:
+            print(f"[RANGE] {ticker}: dropped {dropped} row(s) with null OHLC (Volume-only shells)")
 
         if df.empty:
             return None
